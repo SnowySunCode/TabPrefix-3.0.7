@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';import {createRequire}from'node:module';import path from'node:path';
+const {LiveSave,StateSync,Journal,copy}=createRequire(import.meta.url)(path.resolve(process.argv[2]||'.','resources/web/live-save.js'));
+let checks=0;const check=(condition,message)=>{assert.ok(condition,message);checks++;};
+class Storage{constructor(){this.values=new Map();}get length(){return this.values.size;}key(n){return [...this.values.keys()][n]??null;}getItem(k){return this.values.get(k)??null;}setItem(k,v){this.values.set(k,String(v));}removeItem(k){this.values.delete(k);}}
+const storage=new Storage(),scope={workspace:'server-A',owner:'admin',scope:'display',storage};
+const first=new Journal({...scope,client:'first-tab'}),second=new Journal({...scope,client:'new-tab'}),base={name:'Server',footer:'Old',flag:true};
+first.write({base,document:{...base,footer:'Pending footer'},revision:1});
+let doc={...base,name:'New server name'},server=copy(doc);const recovered=new LiveSave({get:()=>doc,apply:v=>doc=v,base:server,revision:2,delay:5000,journal:v=>second.write(v),read:async()=>null,write:async v=>{server=copy(v);return{document:server,revision:3};}});
+recovered.recover(second.read());check(doc.footer==='Pending footer'&&doc.name==='New server name','a new tab recovers pending work without reverting a newer server field');
+await recovered.flush();check(server.footer==='Pending footer'&&!recovered.dirty,'recovered work commits automatically');check(!new Journal({...scope,client:'third-tab'}).read().length,'acknowledged adopted records do not return on the next session');recovered.close();
+first.write({base,document:{...base,footer:'Private draft'},revision:1});
+for(const change of[{workspace:'another-server'},{owner:'another-owner'},{scope:'prefix:vip'}])check(!new Journal({...scope,...change,client:'other-tab'}).read().length,'drafts are isolated by '+Object.keys(change)[0]);
+second.read();first.write({base,document:{...base,footer:'A newer edit'},revision:1});second.write(null);check(first.read()[0].document.footer==='A newer edit','acknowledging an adopted record cannot erase a later edit in its original tab');
+first.write(null);
+first.write({base,document:{...base,footer:'Our footer',flag:false},revision:1});doc={...base,footer:'Their footer'};
+const conflict=new LiveSave({get:()=>doc,apply:v=>doc=v,base:doc,revision:2,delay:5000,read:async()=>null,write:async()=>({revision:3})});conflict.recover(second.read());check(conflict.phase==='conflict','a conflicting old draft cannot silently overwrite current server data');conflict.resolve(false);check(doc.footer==='Their footer'&&doc.flag===false,'server conflict choice retains independent recovered edits');conflict.close();
+let release,calls=0;const sync=new StateSync({view:'studio',fetch:async()=>{calls++;if(calls===1)return new Promise(r=>release=r);return {session:{owner:'admin'},versions:{display:'2',assets:'aaa'},display:{design:{name:'Latest'},revision:2}};}});
+const read1=sync.read(),read2=sync.read();release({session:{owner:'admin'},versions:{display:'1',assets:'aaa'},display:{design:{name:'Old'},revision:1},assets:[{id:'image'}]});await Promise.all([read1,read2]);check(calls===1,'concurrent domains share one metadata request');
+await sync.read();check(sync.data.display.revision===2&&sync.data.assets.length===1,'conditional updates retain unchanged domain metadata');
+let oldReply,raceCalls=0;const race=new StateSync({view:'prefix',fetch:async()=>{raceCalls++;if(raceCalls===1)return new Promise(r=>oldReply=r);return{versions:{prefix:'new'},prefix:{revision:'new',document:{text:'Committed'}}};}});
+const pending=race.read();race.acknowledge('prefix',{revision:'new',document:{text:'Committed'}},'new');oldReply({versions:{prefix:'old'},prefix:{revision:'old',document:{text:'Stale'}}});const result=await pending;check(result.prefix.document.text==='Committed'&&raceCalls===2,'a read begun before an acknowledgement cannot roll a domain back');
+storage.setItem(first.key,JSON.stringify({base,document:base,time:Date.now()-604800001}));check(!first.read().length,'expired cache is ignored');storage.setItem(first.key,'broken JSON');check(!first.read().length,'malformed cache cannot block initialization');
+console.log('PASS: '+checks+' state-sync checks: new tabs, scoped recovery, independent fields, acknowledgements, coalesced snapshots and stale reads.');
